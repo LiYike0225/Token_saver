@@ -127,14 +127,18 @@ KEYWORD_WEIGHTS: dict[str, float] = {
     "证明": 3.0, "权衡": 2.5, "架构": 2.5, "分析": 2.0, "为什么": 2.0,
     "推理": 2.0, "优化": 1.5, "复杂": 1.5,
     "prove": 3.0, "tradeoff": 2.5, "architect": 2.5, "analyze": 2.0,
+    "reason": 2.0, "optimize": 1.5, "complex": 1.5, "derive": 2.5,
     # mid 信号
     "实现": 1.5, "重构": 2.0, "调试": 1.5, "代码": 1.5, "函数": 1.0,
     "code": 1.5, "implement": 1.5, "refactor": 2.0, "fix": 1.0, "bug": 1.0,
+    "function": 1.0, "debug": 1.5, "write a": 1.0,
     # simple 信号（负分往下拉）
     "翻译": -2.0, "总结": -2.0, "改写": -1.5, "格式化": -1.5,
-    "translate": -2.0, "summarize": -2.0, "rephrase": -1.5,
+    "translate": -2.0, "summarize": -2.0, "rephrase": -1.5, "format": -1.5,
     # 语义下拉：暗示 "只要文字说明" 而非真要执行
     "思路": -1.5, "告诉我": -0.8, "解释一下": -0.8, "说一下": -0.8,
+    "idea": -1.5, "in plain english": -1.5, "just describe": -1.0,
+    "in words": -1.0, "tell me": -0.8,
 }
 
 NEGATIONS = ["不要", "别", "without", "no code", "don't"]
@@ -186,9 +190,15 @@ def dispatch_with_llm(prompt: str) -> tuple[RouteDecision, dict]:
     if re.search(r"为什么.*[？?]", prompt):
         score += 1.5
         matched.append("句式: '为什么...?' (+1.5)")
+    if re.search(r"\bwhy\b.*\?", text):
+        score += 1.5
+        matched.append("pattern: 'why...?' (+1.5)")
     if re.match(r"^\s*翻译[:：]", prompt):
         score = min(score, -2.0)
         matched.append("句式: '翻译:' 开头 → 强制 cheap")
+    if re.match(r"^\s*translate\s*[:：]", text):
+        score = min(score, -2.0)
+        matched.append("pattern: 'translate:' prefix → force cheap")
     if "```" in prompt and len(prompt) > 400:
         score += 2.0
         matched.append("长代码块 (+2.0)")
@@ -391,48 +401,49 @@ def compare_strategies(task: Task) -> None:
 
 # ---------- Demo 数据 ----------
 DEMO_PROMPTS = [
-    "翻译: Hello world",
-    "帮我写一个 Python 函数，把列表去重并保持顺序",
-    "请分析一下 CAP 定理在分布式数据库设计中的权衡，并证明为什么不可能同时满足三者",
-    "总结这段话: 今天天气不错",
+    "Translate: Hello world",
+    "Write a Python function to deduplicate a list while preserving order",
+    "Analyze the tradeoffs of the CAP theorem in distributed databases and prove why all three properties cannot be satisfied simultaneously",
+    "Summarize this: the weather is nice today",
     "fix this bug: ```python\ndef f(x): return x/0\n```",
 ]
 
-# 对抗性 prompt：rule 路由会翻车，LLM dispatcher 应该处理得更好
+# 对抗性 prompt: rule 会翻车, LLM dispatcher 应该处理得更好
 DISPATCHER_DEMO_PROMPTS = [
-    # rule 会命中"代码"+"实现"判 mid；dispatcher 检测到"不要"否定 → 应判 cheap
-    "不要给我代码，只用文字告诉我去重算法的实现思路就好",
-    # rule 看到"翻译"判 cheap；dispatcher 看到长句+分析任务，应升 mid
-    "翻译这段并分析作者的语气：The weather is unexpectedly nice today.",
-    # rule 命中"代码"判 mid；dispatcher 看到"为什么...？"句式应升 top
-    "为什么这段代码会出现 race condition？请深入分析",
-    # 长但简单 — rule 因长度不会降档；dispatcher 看关键词应判 cheap
-    "总结一下下面这段会议纪要的要点，列成三条 bullet：今天我们讨论了下周的发布计划，"
-    "前端要在周一前完成 UI 改版，后端 API 周二上线，QA 周三跑回归测试，周四发布。",
+    # rule 命中 "algorithm" 升 top; dispatcher 检测到 "don't" 否定 + "idea" 负分 → 应判 cheap
+    "Don't give me code — just describe the dedup algorithm idea in plain English",
+    # rule 命中 "analyze" 升 top; dispatcher 看 "translate"(-2) + "analyze"(+2) = 0 → cheap
+    "Translate this and analyze the author's tone: The weather is unexpectedly nice today.",
+    # rule 和 dispatcher 都应判 top (一致的难任务)
+    "Why does this code have a race condition? Please analyze in depth.",
+    # 长但简单 — rule 因长度不会降档; dispatcher 看 "summarize" 应判 cheap
+    "Summarize the meeting notes below into three bullets: today we discussed next week's "
+    "release plan. Frontend ships UI redesign by Monday, backend API by Tuesday, "
+    "QA runs regression on Wednesday, release on Thursday.",
 ]
 
 DEMO_TASKS = [
-    Task("新闻聚合机器人", [
-        Subtask("抓取 RSS feed 并解析标题",
-                "请帮我列出 RSS feed 里所有条目的标题和发布时间",          "cheap"),
-        Subtask("写一个去重函数",
-                "写一个 Python 函数对新闻列表按 URL 字段去重并保持顺序",   "mid"),
-        Subtask("逐条生成 50 字摘要",
-                "帮我把这条新闻总结成 50 字以内的中文摘要",                "cheap"),
-        Subtask("设计推送策略与频控",
-                "请分析不同推送频率下的用户疲劳度权衡，设计一个最优推送策略",  "top"),
-        Subtask("生成 markdown 日报",
-                "把以下新闻条目格式化为 markdown 列表，附超链接",          "cheap"),
+    Task("News aggregator bot", [
+        Subtask("Fetch RSS feed and parse titles",
+                "List all entries from the RSS feed with title and publish time",   "cheap"),
+        Subtask("Write a dedup function",
+                "Write a Python function to deduplicate the news list by URL while preserving order",  "mid"),
+        Subtask("Summarize each item in 50 words",
+                "Summarize this news article in under 50 English words",            "cheap"),
+        Subtask("Design push strategy & rate limiting",
+                "Analyze the tradeoffs of different push frequencies on user fatigue and design an optimal push strategy",  "top"),
+        Subtask("Generate markdown daily digest",
+                "Format the following news items into a markdown list with hyperlinks",  "cheap"),
     ]),
-    Task("Code Review 并发模块", [
-        Subtask("列出所有函数签名",
-                "请列出这段代码里所有函数的签名（名字+参数）",              "cheap"),
-        Subtask("逐函数实现检查",
-                "为这段代码的每个函数实现对应的单元测试",                  "mid"),
-        Subtask("并发安全性深度分析",
-                "请深入分析这段代码的并发安全性，证明为什么会出现 race condition",  "top"),
-        Subtask("给出重构方案",
-                "请给出针对线程安全问题的重构方案并分析多种实现的权衡",       "top"),
+    Task("Code review of a concurrency module", [
+        Subtask("List all function signatures",
+                "List the signatures (name + params) of every function in this code",  "cheap"),
+        Subtask("Per-function implementation check",
+                "Implement unit tests for each function in this code",              "mid"),
+        Subtask("Deep concurrency-safety analysis",
+                "Deeply analyze the concurrency safety of this code and prove why a race condition occurs",  "top"),
+        Subtask("Propose refactoring plan",
+                "Propose a refactoring plan for the thread-safety issues and analyze the tradeoffs of multiple implementations",  "top"),
     ]),
 ]
 

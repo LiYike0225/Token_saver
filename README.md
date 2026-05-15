@@ -1,127 +1,130 @@
 # LLM Router Demo
 
-一个极简的多模型路由器 demo，灵感来自 [Poe](https://poe.com/)：根据任务难度把请求分发到不同价位的 LLM，省 token 成本。
+A minimal multi-model router demo, inspired by [Poe](https://poe.com/): dispatch each request to a different-priced LLM based on task difficulty to save token costs.
 
-**这是一个 mock demo**，不实际调用任何 LLM API。
+**This is a mock demo** — no real LLM APIs are called.
 
-## 思路
+## Motivation
 
-不同 LLM 价格差距很大（Opus 比 GPT-4o-mini 贵 ~100×），但很多日常任务（翻译、总结、格式化）便宜模型完全够用。路由器的目标：
+LLM prices vary by ~100× (Opus vs. GPT-4o-mini), yet many everyday tasks (translation, summarization, formatting) run perfectly well on cheap models. The router's goal:
 
-> 自动判断任务难度 → 选最便宜且够用的模型 → 同等体验下省钱。
+> Auto-classify task difficulty → pick the cheapest model that's good enough → save money without hurting UX.
 
-## 路由策略
+## Routing Strategies
 
-实现了**两种路由模式**，可以横向对比：
+Two routing modes are implemented side-by-side for comparison:
 
-### 模式 1：规则路由 (`mode=rule`，默认)
+### Mode 1: Rule-based (`mode=rule`, default)
 
-快 + 可解释，纯关键词+长度判定，不调任何模型：
+Fast and explainable — pure keyword + length classification, no model calls:
 
-| 触发条件 | 分档 | 默认模型 |
+| Trigger | Tier | Default model |
 |---------|------|---------|
-| 命中 "翻译 / 总结 / translate / summarize…" 或 prompt < 80 字符 | `cheap` | gpt-4o-mini |
-| 命中 "代码 / 函数 / implement / fix…" 或含 ` ``` ` 代码块 | `mid` | sonnet-4.6 |
-| 命中 "分析 / 证明 / 为什么 / reason / prove…" 或长代码块 | `top` | opus-4.7 |
-| 检测到 ≥3 个编号步骤 (`1. 2. 3.`) | 自动升一档 | |
+| Hits "translate / summarize / 翻译 / 总结…" or prompt < 80 chars | `cheap` | gpt-4o-mini |
+| Hits "code / function / implement / fix…" or contains ` ``` ` block | `mid` | sonnet-4.6 |
+| Hits "analyze / prove / why / 分析 / 证明…" or long code block | `top` | opus-4.7 |
+| Detected ≥3 numbered steps (`1. 2. 3.`) | bump up one tier | |
 
-每次路由都会打印命中的具体规则，方便调试和理解。
+Every routing decision prints exactly which rule fired — easy to debug and reason about.
 
-### 模式 2：LLM Dispatcher (`mode=llm`)
+### Mode 2: LLM Dispatcher (`mode=llm`)
 
-让一个便宜模型 (haiku-4.5) 当"调度员"专门做难度分类，再分发给执行模型。
-**本 demo 用一个更精细的规则函数模拟它的输出**（带权重 / 否定检测 / 句式匹配），同时把 dispatcher 自己消耗的 token 算进总成本。
+A cheap "dispatcher" model (haiku-4.5) classifies difficulty, then forwards the prompt to the execution model. **This demo mocks the dispatcher** with a more refined rule function (weighted keywords / negation detection / phrase patterns), and accounts for the dispatcher's own token cost.
 
 ```
 prompt
   │
-  ▼  ① dispatcher (haiku-4.5, ~$0.00005/次)
-  │    输出: {"tier": "mid", "score": 1.5, "reason": "代码相关"}
+  ▼  ① dispatcher (haiku-4.5, ~$0.00005/call)
+  │    output: {"tier": "mid", "score": 1.5, "reason": "code-related"}
   ▼
-  ② 执行模型 (gpt-4o-mini / sonnet-4.6 / opus-4.7)
+  ② execution model (gpt-4o-mini / sonnet-4.6 / opus-4.7)
 ```
 
-短路优化：prompt < 18 字符直接回落到规则路由，不调 dispatcher。
+**Short-circuit**: prompts < 18 chars skip the dispatcher entirely and fall back to rules.
 
-**dispatcher 比规则强在哪**：
-- 否定词识别（"不要给我代码…" → 不会因为命中"代码"被错判 mid）
-- 关键词冲突时按权重打分而非先命中先赢
-- 句式模式 (`为什么...?` → top；`^翻译:` → 强制 cheap)
+**Where the dispatcher beats rules**:
+- Negation handling ("don't give me code…" → won't mis-route to mid just because "code" is mentioned)
+- Weighted scoring instead of first-keyword-wins
+- Phrase patterns (`why...?` → top; `^translate:` → forced cheap)
 
-**dispatcher 不是免费午餐**：自身要花 token，**只有遇到歧义/对抗性 prompt 才回本**。简单清晰的 prompt 上，规则免费且同样准——见下面对比。
+**Dispatcher is not free**: it spends tokens itself, and **only pays off on ambiguous/adversarial prompts**. On clear-cut prompts, rules are free and equally accurate — see comparison below.
 
-## 用法
+## Usage
 
 ```bash
-# 跑内置 6 条 demo prompt
+# Run the full built-in demo (single prompts + multi-agent tasks)
 python3 router.py
 
-# 路由单条 prompt
-python3 router.py "帮我写一个 Python 函数把列表去重"
+# Route a single prompt (prints both rule and llm modes)
+python3 router.py "write a Python function to deduplicate a list"
 ```
 
-无依赖，纯 Python 标准库。
+No dependencies — pure Python stdlib.
 
-## 输出示例
+## Example Output
 
 ```
-PROMPT : 帮我写一个 Python 函数，把列表去重并保持顺序
-TIER   : mid   →   MODEL: sonnet-4.6
+PROMPT : write a Python function to deduplicate a list while preserving order
+MODE   : rule   →   TIER: mid   MODEL: sonnet-4.6
 REASON :
-   • 命中代码/实现类关键词: ['写一个', '函数']
-   • 选择 tier=mid 中默认模型: sonnet-4.6
+   • hit code/implementation keywords: ['function']
+   • picked tier=mid default model: sonnet-4.6
 TOKENS : in=6  out=9
-COST   : $0.000153   (baseline opus-4.7: $0.000765, 省 $0.000612 / 80.0%)
+COST   : $0.000153
+         baseline opus-4.7: $0.000765, saved $0.000612 / 80.0%
 QUALITY: 9/10   (baseline opus-4.7: 9/10)
 ```
 
-## 用户体验质量分 (mock)
+## UX Quality Score (mock)
 
-每次路由会算一个质量分 (1–10)，用来对照"省了钱有没有掉体验"。规则：
+Each routed call gets a 1–10 quality score, so you can tell whether saving money hurt UX:
 
-| 模型档位 vs 任务难度 | 质量分 |
-|----------------------|------:|
-| 模型 = 任务难度 (刚好匹配) | 9 |
-| 模型 > 任务难度 (over-spec) | 10 |
-| 模型 < 任务难度 1 档 | 6 |
-| 模型 < 任务难度 2 档 | 3 |
+| Model tier vs task tier | Quality |
+|-------------------------|--------:|
+| Model = task difficulty (perfect match) | 9 |
+| Model > task difficulty (over-spec) | 10 |
+| Model < task difficulty by 1 tier | 6 |
+| Model < task difficulty by 2 tiers | 3 |
 
-## 规则 vs Dispatcher 对抗性对比
+## Rules vs Dispatcher — Adversarial Comparison
 
-跑 `python3 router.py` 后会先打印这张表（节选）：
-
-```
-PROMPT                                  rule              llm-dispatch
-不要给我代码，只用文字告诉我去重算法的实现思路就好    opus-4.7   q9 ⚠   gpt-4o-mini  q9 ✅
-翻译这段并分析作者的语气：The weather is...       opus-4.7   q9 ⚠   gpt-4o-mini  q9 ✅
-为什么这段代码会出现 race condition？请深入分析     opus-4.7   q9 ✅   opus-4.7    q9 ✅
-```
-
-前两条 rule 误升到 opus（被"算法"/"分析"等关键词带偏），dispatcher 靠否定词和权重正确降到 cheap → 直接省 ~100×。
-
-## 多 Agent 协作任务
-
-一个复杂 task 通常由多个子步骤组成，每步难度不同。本 demo 内置两个示例任务（新闻聚合机器人 / 代码 review），每个子任务标注真实难度，对比 **4 种策略**：
-
-| 策略 | 思路 | 适用 |
-|------|------|------|
-| `all-cheap` | 全用便宜模型 | 省钱激进，但难任务质量会崩 |
-| `routed` | 规则路由 | 平衡，0 路由开销 ✅ |
-| `llm-dispatch` | LLM 调度员 | 同质量但多花 dispatcher 钱（清晰 prompt 不划算） |
-| `all-top` | 全用顶配 | 质量满分但浪费 |
-
-跑完会打印对比，例如新闻聚合任务：
+Running `python3 router.py` prints this table (excerpt):
 
 ```
-all-cheap     $0.000034   7.2/10   ← 难任务崩了
-routed        $0.001078   9.0/10   ← 规则就够用
-llm-dispatch  $0.002262   9.0/10   [dispatcher 自身 $0.001184，纯开销]
+PROMPT                                            rule              llm-dispatch
+Don't give me code, just describe the dedup       opus-4.7  q9 ⚠   gpt-4o-mini  q9 ✅
+  algorithm idea in words
+Translate this and analyze the author's tone:     opus-4.7  q9 ⚠   gpt-4o-mini  q9 ✅
+  "The weather is unexpectedly nice today."
+Why does this code have a race condition?         opus-4.7  q9 ✅   opus-4.7     q9 ✅
+  Please analyze in depth.
+```
+
+In the first two, rules wrongly escalate to opus (misled by keywords like "algorithm" / "analyze"). The dispatcher catches the negation and the simple-intent phrases to correctly downgrade to cheap → ~100× savings.
+
+## Multi-Agent Tasks
+
+A complex task usually decomposes into multiple sub-steps of varying difficulty. The demo includes two example tasks (news aggregator bot / code review for a concurrency module). Each subtask is labeled with its true difficulty, and we compare **4 strategies**:
+
+| Strategy | Idea | When it wins |
+|----------|------|--------------|
+| `all-cheap` | Use cheap model everywhere | Aggressive savings, but hard tasks collapse |
+| `routed` | Rule-based routing | Balanced, zero routing overhead ✅ |
+| `llm-dispatch` | LLM dispatcher | Same quality on unambiguous tasks but pays dispatcher overhead |
+| `all-top` | Use top model everywhere | Max quality, wasteful |
+
+Output for the news aggregator task:
+
+```
+all-cheap     $0.000034   7.2/10   ← hard subtasks collapsed
+routed        $0.001078   9.0/10   ← rules are sufficient
+llm-dispatch  $0.002262   9.0/10   [dispatcher cost $0.001184 — pure overhead]
 all-top       $0.004185   9.8/10
 ```
 
-**结论**：清晰任务上 dispatcher 是浪费；只有歧义/对抗 prompt 上 dispatcher 才值得调。生产里通常加更激进的短路（长度、白名单关键词）来减少 dispatcher 调用次数。
+**Takeaway**: on clear-cut tasks, the dispatcher is pure waste. It only pays off on ambiguous/adversarial prompts. In production, aggressive short-circuiting (length, allowlist keywords, caching classifications) is needed to keep dispatcher calls low enough to break even.
 
-## 模型池 (mock 价格，参考 2026 市价)
+## Model Pool (mock prices, ~2026 market)
 
 | Model | Tier | Input $/1M | Output $/1M |
 |-------|------|-----------:|------------:|
@@ -132,12 +135,14 @@ all-top       $0.004185   9.8/10
 | gpt-4o         | mid   | 2.50  | 10.00 |
 | opus-4.7       | top   | 15.00 | 75.00 |
 
-## 接入真实 API
+## Swapping in Real APIs
 
-`router.py` 里只需改两处：
+Only two functions in `router.py` need to change:
 
-1. `mock_call()` → 替换为 `openai` / `anthropic` SDK 的真实调用
-2. `MODELS` 里价格表保留，token 数从 API response 里拿真实值
+1. `mock_call()` → replace with `openai` / `anthropic` SDK calls
+2. `dispatch_with_llm()` → replace the mock rule body with a real Haiku call returning the same `RouteDecision` shape
+
+The `MODELS` price table stays — just plug real token counts from the API response into `cost()`.
 
 ## License
 

@@ -113,6 +113,108 @@ def classify(prompt: str) -> RouteDecision:
     return RouteDecision(tier=tier, model=model, reasons=reasons)
 
 
+# ---------- 方案三: LLM Dispatcher (mock) ----------
+# 真实实现里这里会调一个便宜模型（如 haiku-4.5）做分类。这里我们用一个
+# 更精细的规则函数模拟它的输出 —— 带权重、否定检测、句式匹配。
+# 同时把 dispatcher 自己消耗的 token 成本计入总账。
+
+DISPATCHER_MODEL = "haiku-4.5"
+SHORT_CIRCUIT_LEN = 18   # 短于此跳过 dispatcher（不值得调用）
+DISPATCHER_SYS_TOKENS = 80   # 假装的 system prompt 开销
+
+KEYWORD_WEIGHTS: dict[str, float] = {
+    # hard 信号（正分大）
+    "证明": 3.0, "权衡": 2.5, "架构": 2.5, "分析": 2.0, "为什么": 2.0,
+    "推理": 2.0, "优化": 1.5, "复杂": 1.5,
+    "prove": 3.0, "tradeoff": 2.5, "architect": 2.5, "analyze": 2.0,
+    # mid 信号
+    "实现": 1.5, "重构": 2.0, "调试": 1.5, "代码": 1.5, "函数": 1.0,
+    "code": 1.5, "implement": 1.5, "refactor": 2.0, "fix": 1.0, "bug": 1.0,
+    # simple 信号（负分往下拉）
+    "翻译": -2.0, "总结": -2.0, "改写": -1.5, "格式化": -1.5,
+    "translate": -2.0, "summarize": -2.0, "rephrase": -1.5,
+    # 语义下拉：暗示 "只要文字说明" 而非真要执行
+    "思路": -1.5, "告诉我": -0.8, "解释一下": -0.8, "说一下": -0.8,
+}
+
+NEGATIONS = ["不要", "别", "without", "no code", "don't"]
+
+
+def _is_negated(text: str, keyword: str, window: int = 8) -> bool:
+    """关键词前 window 个字符内是否有否定词。"""
+    idx = text.find(keyword)
+    if idx < 0:
+        return False
+    left = text[max(0, idx - window):idx]
+    return any(neg in left for neg in NEGATIONS)
+
+
+def dispatch_with_llm(prompt: str) -> tuple[RouteDecision, dict]:
+    """
+    Mock 一个 LLM dispatcher。返回 (RouteDecision, dispatcher_meta)。
+
+    真实实现 (伪代码):
+        resp = anthropic.messages.create(
+            model="claude-haiku-4-5",
+            system="把任务分成 cheap/mid/top 三档，输出 JSON",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return parse_json(resp), {"cost": resp.usage.cost, ...}
+    """
+    # ---- 短路：太短的 prompt 不值得调 dispatcher ----
+    if len(prompt) < SHORT_CIRCUIT_LEN:
+        d = classify(prompt)
+        d.reasons.insert(0,
+            f"短路: prompt < {SHORT_CIRCUIT_LEN} 字符，跳过 dispatcher，"
+            f"回落到规则路由")
+        return d, {"called": False, "cost": 0.0, "tokens": (0, 0)}
+
+    text = prompt.lower()
+    score = 0.0
+    matched: list[str] = []
+
+    # ---- 加权关键词 + 否定检测 ----
+    for kw, w in KEYWORD_WEIGHTS.items():
+        if kw in text:
+            if _is_negated(text, kw):
+                matched.append(f"{kw}({w:+.1f}, 被否定→丢弃)")
+                continue
+            score += w
+            matched.append(f"{kw}({w:+.1f})")
+
+    # ---- 句式模式 ----
+    if re.search(r"为什么.*[？?]", prompt):
+        score += 1.5
+        matched.append("句式: '为什么...?' (+1.5)")
+    if re.match(r"^\s*翻译[:：]", prompt):
+        score = min(score, -2.0)
+        matched.append("句式: '翻译:' 开头 → 强制 cheap")
+    if "```" in prompt and len(prompt) > 400:
+        score += 2.0
+        matched.append("长代码块 (+2.0)")
+
+    # ---- 分档 ----
+    if score >= 4.5:
+        tier = "top"
+    elif score >= 1.0:
+        tier = "mid"
+    else:
+        tier = "cheap"
+
+    # ---- 计算 dispatcher 自己的成本 ----
+    disp_in  = DISPATCHER_SYS_TOKENS + max(1, len(prompt) // 4)
+    disp_out = 30   # JSON 输出约 30 token
+    disp_cost = cost(DISPATCHER_MODEL, disp_in, disp_out)
+
+    reasons = [
+        f"LLM dispatcher ({DISPATCHER_MODEL}) 输出: score={score:+.1f} → tier={tier}",
+        f"命中信号: {matched[:6] if matched else ['(无)']}",
+        f"选择模型: {TIER_DEFAULT[tier]}",
+    ]
+    decision = RouteDecision(tier=tier, model=TIER_DEFAULT[tier], reasons=reasons)
+    return decision, {"called": True, "cost": disp_cost, "tokens": (disp_in, disp_out)}
+
+
 # ---------- Mock 调用 & 成本 ----------
 def mock_call(model: str, prompt: str) -> tuple[str, int, int]:
     """假装调用 LLM，返回 (response, input_tokens, output_tokens)。"""
@@ -140,10 +242,17 @@ def score_quality(model_tier: str, task_tier: str) -> int:
 
 
 # ---------- 单条 prompt 路由 ----------
-def route_and_run(prompt: str) -> dict:
-    decision = classify(prompt)
+def route_and_run(prompt: str, mode: str = "rule") -> dict:
+    """mode: 'rule' (方案一) or 'llm' (方案三, 带 dispatcher)"""
+    if mode == "llm":
+        decision, disp_meta = dispatch_with_llm(prompt)
+    else:
+        decision = classify(prompt)
+        disp_meta = {"called": False, "cost": 0.0, "tokens": (0, 0)}
+
     response, in_tok, out_tok = mock_call(decision.model, prompt)
-    actual_cost   = cost(decision.model, in_tok, out_tok)
+    exec_cost = cost(decision.model, in_tok, out_tok)
+    actual_cost   = exec_cost + disp_meta["cost"]
     baseline_cost = cost(BASELINE_MODEL, in_tok, out_tok)
     saved = baseline_cost - actual_cost
     saved_pct = (saved / baseline_cost * 100) if baseline_cost else 0
@@ -153,9 +262,13 @@ def route_and_run(prompt: str) -> dict:
 
     return {
         "prompt": prompt,
+        "mode": mode,
         "decision": decision,
         "response": response,
         "tokens": (in_tok, out_tok),
+        "exec_cost": exec_cost,
+        "dispatcher_cost": disp_meta["cost"],
+        "dispatcher_called": disp_meta["called"],
         "actual_cost": actual_cost,
         "baseline_cost": baseline_cost,
         "saved": saved,
@@ -170,14 +283,18 @@ def print_result(r: dict) -> None:
     in_tok, out_tok = r["tokens"]
     print("─" * 70)
     print(f"PROMPT : {r['prompt']}")
-    print(f"TIER   : {d.tier}   →   MODEL: {d.model}")
+    print(f"MODE   : {r['mode']}   →   TIER: {d.tier}   MODEL: {d.model}")
     print("REASON :")
     for line in d.reasons:
         print(f"   • {line}")
     print(f"TOKENS : in={in_tok}  out={out_tok}")
-    print(f"COST   : ${r['actual_cost']:.6f}   "
-          f"(baseline {BASELINE_MODEL}: ${r['baseline_cost']:.6f}, "
-          f"省 ${r['saved']:.6f} / {r['saved_pct']:.1f}%)")
+    if r["dispatcher_called"]:
+        print(f"COST   : ${r['actual_cost']:.6f} "
+              f"(exec ${r['exec_cost']:.6f} + dispatcher ${r['dispatcher_cost']:.6f})")
+    else:
+        print(f"COST   : ${r['actual_cost']:.6f}")
+    print(f"         baseline {BASELINE_MODEL}: ${r['baseline_cost']:.6f}, "
+          f"省 ${r['saved']:.6f} / {r['saved_pct']:.1f}%")
     print(f"QUALITY: {r['quality']}/10   "
           f"(baseline {BASELINE_MODEL}: {r['baseline_quality']}/10)")
     print(f"REPLY  : {r['response']}")
@@ -197,12 +314,16 @@ class Task:
     subtasks: list[Subtask] = field(default_factory=list)
 
 
-# 三种策略：路由 / 全用便宜的 / 全用最贵的
+# 四种策略：全便宜 / 规则路由 / LLM 调度 / 全顶配
 def run_subtask(sub: Subtask, strategy: str) -> dict:
+    disp_cost = 0.0
     if strategy == "routed":
         decision = classify(sub.prompt)
-        model = decision.model
-        reasons = decision.reasons
+        model, reasons = decision.model, decision.reasons
+    elif strategy == "llm-dispatch":
+        decision, meta = dispatch_with_llm(sub.prompt)
+        model, reasons = decision.model, decision.reasons
+        disp_cost = meta["cost"]
     elif strategy == "all-cheap":
         model = TIER_DEFAULT["cheap"]
         reasons = ["策略=all-cheap，强制用便宜模型"]
@@ -213,13 +334,14 @@ def run_subtask(sub: Subtask, strategy: str) -> dict:
         raise ValueError(strategy)
 
     _, in_tok, out_tok = mock_call(model, sub.prompt)
-    c = cost(model, in_tok, out_tok)
+    c = cost(model, in_tok, out_tok) + disp_cost
     q = score_quality(MODELS[model].tier, sub.true_tier)
     return {
         "subtask": sub,
         "model": model,
         "reasons": reasons,
         "cost": c,
+        "dispatcher_cost": disp_cost,
         "quality": q,
         "tokens": (in_tok, out_tok),
     }
@@ -251,23 +373,20 @@ def compare_strategies(task: Task) -> None:
     print(f"### Multi-Agent Task: {task.name}")
     print("=" * 70)
 
-    runs = {s: run_task(task, s) for s in ["all-cheap", "routed", "all-top"]}
+    strategies = ["all-cheap", "routed", "llm-dispatch", "all-top"]
+    runs = {s: run_task(task, s) for s in strategies}
     for r in runs.values():
         print_task_run(r)
 
-    baseline = runs["all-top"]
-    routed   = runs["routed"]
-    cheap    = runs["all-cheap"]
-    saved = baseline["total_cost"] - routed["total_cost"]
-    saved_pct = saved / baseline["total_cost"] * 100
-    q_drop = baseline["avg_quality"] - routed["avg_quality"]
-    print("\n  ┃ 路由 vs 全顶配 (baseline):")
-    print(f"  ┃   省钱     : ${saved:.6f}  ({saved_pct:.1f}%)")
-    print(f"  ┃   质量损失 : {q_drop:.1f}/10  "
-          f"({routed['avg_quality']:.1f} vs {baseline['avg_quality']:.1f})")
-    print("  ┃ 路由 vs 全便宜 (省钱激进):")
-    print(f"  ┃   多花     : ${routed['total_cost'] - cheap['total_cost']:.6f}")
-    print(f"  ┃   换来质量 : +{routed['avg_quality'] - cheap['avg_quality']:.1f}/10")
+    print("\n  ┃ 横向对比 (cost / avg quality):")
+    for s in strategies:
+        r = runs[s]
+        extra = ""
+        if s == "llm-dispatch":
+            disp = sum(x["dispatcher_cost"] for x in r["results"])
+            extra = f"  [dispatcher 自身 ${disp:.6f}]"
+        print(f"  ┃   {s:<13} ${r['total_cost']:.6f}   "
+              f"{r['avg_quality']:.1f}/10{extra}")
 
 
 # ---------- Demo 数据 ----------
@@ -279,61 +398,80 @@ DEMO_PROMPTS = [
     "fix this bug: ```python\ndef f(x): return x/0\n```",
 ]
 
+# 对抗性 prompt：rule 路由会翻车，LLM dispatcher 应该处理得更好
+DISPATCHER_DEMO_PROMPTS = [
+    # rule 会命中"代码"+"实现"判 mid；dispatcher 检测到"不要"否定 → 应判 cheap
+    "不要给我代码，只用文字告诉我去重算法的实现思路就好",
+    # rule 看到"翻译"判 cheap；dispatcher 看到长句+分析任务，应升 mid
+    "翻译这段并分析作者的语气：The weather is unexpectedly nice today.",
+    # rule 命中"代码"判 mid；dispatcher 看到"为什么...？"句式应升 top
+    "为什么这段代码会出现 race condition？请深入分析",
+    # 长但简单 — rule 因长度不会降档；dispatcher 看关键词应判 cheap
+    "总结一下下面这段会议纪要的要点，列成三条 bullet：今天我们讨论了下周的发布计划，"
+    "前端要在周一前完成 UI 改版，后端 API 周二上线，QA 周三跑回归测试，周四发布。",
+]
+
 DEMO_TASKS = [
     Task("新闻聚合机器人", [
         Subtask("抓取 RSS feed 并解析标题",
-                "请帮我列出 RSS feed 里所有条目的标题",                 "cheap"),
+                "请帮我列出 RSS feed 里所有条目的标题和发布时间",          "cheap"),
         Subtask("写一个去重函数",
-                "写一个 Python 函数对新闻列表按 URL 去重",              "mid"),
+                "写一个 Python 函数对新闻列表按 URL 字段去重并保持顺序",   "mid"),
         Subtask("逐条生成 50 字摘要",
-                "帮我总结这条新闻为 50 字",                            "cheap"),
+                "帮我把这条新闻总结成 50 字以内的中文摘要",                "cheap"),
         Subtask("设计推送策略与频控",
-                "请分析不同推送频率的权衡，设计一个最优推送策略",         "top"),
+                "请分析不同推送频率下的用户疲劳度权衡，设计一个最优推送策略",  "top"),
         Subtask("生成 markdown 日报",
-                "把以下条目格式化为 markdown 列表",                    "cheap"),
+                "把以下新闻条目格式化为 markdown 列表，附超链接",          "cheap"),
     ]),
     Task("Code Review 并发模块", [
         Subtask("列出所有函数签名",
-                "列出这段代码的所有函数",                              "cheap"),
+                "请列出这段代码里所有函数的签名（名字+参数）",              "cheap"),
         Subtask("逐函数实现检查",
-                "实现一下每个函数的单元测试",                          "mid"),
+                "为这段代码的每个函数实现对应的单元测试",                  "mid"),
         Subtask("并发安全性深度分析",
-                "请分析这段代码的并发安全性，证明为什么会有 race condition",  "top"),
+                "请深入分析这段代码的并发安全性，证明为什么会出现 race condition",  "top"),
         Subtask("给出重构方案",
-                "请给出重构方案并分析权衡",                            "top"),
+                "请给出针对线程安全问题的重构方案并分析多种实现的权衡",       "top"),
     ]),
 ]
 
 
 # ---------- 主流程 ----------
+def _print_compare_table(prompts: list[str], header: str) -> None:
+    print("\n" + "=" * 70)
+    print(f"### {header}")
+    print("=" * 70)
+    print(f"{'PROMPT':<46}  {'rule':<22}  {'llm-dispatch':<22}")
+    print("-" * 96)
+    for p in prompts:
+        r1 = route_and_run(p, mode="rule")
+        r2 = route_and_run(p, mode="llm")
+        flag1 = "✅" if r1["quality"] >= 9 else "⚠"
+        flag2 = "✅" if r2["quality"] >= 9 else "⚠"
+        col1 = f"{r1['decision'].model:<14} q{r1['quality']}/10 {flag1}"
+        col2 = f"{r2['decision'].model:<14} q{r2['quality']}/10 {flag2}"
+        short = p[:43] + "..." if len(p) > 46 else p
+        print(f"{short:<46}  {col1:<22}  {col2:<22}")
+
+
 def main() -> None:
     if len(sys.argv) > 1:
         prompt = " ".join(sys.argv[1:])
-        print_result(route_and_run(prompt))
+        print("--- mode=rule ---")
+        print_result(route_and_run(prompt, mode="rule"))
+        print("\n--- mode=llm ---")
+        print_result(route_and_run(prompt, mode="llm"))
         return
 
-    print("=" * 70)
-    print("### 单条 prompt 路由")
-    print("=" * 70)
-    total_actual = total_baseline = 0.0
-    total_q = total_baseline_q = 0.0
-    for p in DEMO_PROMPTS:
-        r = route_and_run(p)
-        print_result(r)
-        total_actual     += r["actual_cost"]
-        total_baseline   += r["baseline_cost"]
-        total_q          += r["quality"]
-        total_baseline_q += r["baseline_quality"]
-    n = len(DEMO_PROMPTS)
-    print("─" * 70)
-    print(f"SUMMARY: 共 {n} 条")
-    print(f"  路由总成本   : ${total_actual:.6f}")
-    print(f"  全跑 {BASELINE_MODEL} : ${total_baseline:.6f}")
-    print(f"  节省          : ${total_baseline - total_actual:.6f} "
-          f"({(1 - total_actual/total_baseline)*100:.1f}%)")
-    print(f"  平均质量      : {total_q/n:.1f}/10  "
-          f"(baseline: {total_baseline_q/n:.1f}/10)")
+    # 1. 普通 prompt 上两种 mode 通常会一致 —— 验证 dispatcher 不会"更傻"
+    _print_compare_table(DEMO_PROMPTS,
+                         "单条 prompt: rule vs llm-dispatch")
+    # 2. 对抗性 prompt —— dispatcher 应该明显优于 rule
+    _print_compare_table(DISPATCHER_DEMO_PROMPTS,
+                         "对抗性 prompt: dispatcher 的优势场景")
 
+    # 3. 多 agent 任务：4 策略横向对比
     for t in DEMO_TASKS:
         compare_strategies(t)
 
